@@ -5,8 +5,11 @@ description = "Simple OpenAI Agents SDK demo with function tools"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "openai-agents>=0.2.0",
+    "openai-agents>=0.3.3",
     "python-dotenv>=1.0.0",
+    "opentelemetry-instrumentation-openai-agents-v2",
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp>=1.27.0",
 ]
 
 [project.scripts]
