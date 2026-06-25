@@ -1,0 +1,27 @@
+src/demo_agent/otel.py
+  s_daf0fb8f9d8d22::t_e58a30b221984b 41-58
+  s_daf0fb8f9d8d22::t_bcfcfc36e257a7 87-115
+  s_daf0fb8f9d8d22::t_d29e7658231c59 8-14,16
+src/demo_agent/tools.py
+  s_daf0fb8f9d8d22::t_41573f3c5ac045 48
+  s_daf0fb8f9d8d22::t_2e053d3db39417 4
+README.md
+  s_daf0fb8f9d8d22::t_3cd92588cc70fa 77,80,85-103
+  s_daf0fb8f9d8d22::t_73e36703c85894 109,111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.13",
+  "base_commit_sha": "262545c4bf53ead051677d3f565a801d52456a3b",
+  "prompts": {},
+  "sessions": {
+    "s_daf0fb8f9d8d22": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "5cbc3420-eb85-4955-a4b4-6201c15f4b29",
+        "model": "default"
+      },
+      "human_author": "Conrad Corbett <conrad.corbett@langchain.dev>"
+    }
+  }
+}
