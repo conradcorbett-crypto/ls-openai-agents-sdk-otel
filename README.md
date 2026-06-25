@@ -74,38 +74,39 @@ After running, open that project in LangSmith to see the agent, LLM, and tool sp
 
 ## Tool errors
 
-By default, when a `@function_tool` raises, the Agents SDK's built-in `failure_error_function` swallows the exception and returns an error *string* to the model — so the tool span looks like a normal, successful response in LangSmith.
-
-Crucially, LangSmith derives a run's error/status from the OpenTelemetry [`exception` event](https://docs.langchain.com/langsmith/trace-with-opentelemetry#supported-opentelemetry-attribute-and-event-mapping) (`exception.message` / `exception.stacktrace`) — **not** from the span's status code. The GenAI instrumentor sets the span status to `ERROR` but never records an `exception` event, so a failing tool still shows up as green.
-
-To fix this, `get_weather` in [`src/demo_agent/tools.py`](src/demo_agent/tools.py) uses a custom `failure_error_function` that records the exception on the live OTEL span (and marks the SDK span errored) before returning a graceful message:
+The demo's `get_weather` tool simply raises to simulate a downstream outage — there is no tracing code in [`src/demo_agent/tools.py`](src/demo_agent/tools.py):
 
 ```python
-from agents.tracing import SpanError, get_current_span
-from opentelemetry import trace as otel_trace
-from opentelemetry.trace import Status, StatusCode
-
-def _record_tool_error(ctx, error):
-    otel_span = otel_trace.get_current_span()
-    otel_span.record_exception(error)            # LangSmith reads this event
-    otel_span.set_status(Status(StatusCode.ERROR, str(error)))
-    sdk_span = get_current_span()
-    if sdk_span is not None:
-        sdk_span.set_error(SpanError(message="Error running tool", data={...}))
-    return f"The weather service is currently unavailable: {error}"
-
-@function_tool(failure_error_function=_record_tool_error)
+@function_tool
 def get_weather(city: str) -> str:
     raise RuntimeError("Weather service unavailable (HTTP 503)")
 ```
 
-The `get_weather` span now shows up as **errored** in LangSmith (with the exception message/stacktrace) while the population/time spans stay green. Because the handler returns a string instead of re-raising, the agent still produces a final answer.
+When a tool raises, the Agents SDK's built-in error handling returns an error *string* to the model (so the agent still answers) and marks the tracing span as errored, which the GenAI instrumentor maps to an OpenTelemetry `ERROR` status.
+
+That status alone is not enough: LangSmith derives a run's error/status from the OpenTelemetry [`exception` event](https://docs.langchain.com/langsmith/trace-with-opentelemetry#supported-opentelemetry-attribute-and-event-mapping) (`exception.message` / `exception.stacktrace`), **not** from the span's status code — and the instrumentor never records that event. So all of the trace instrumentation lives in [`src/demo_agent/otel.py`](src/demo_agent/otel.py): the `_LangSmithGenAIMappingProcessor` synthesizes the missing `exception` event for any span whose status is `ERROR`, just before export:
+
+```python
+def _ensure_exception_event(span):
+    status = span.status
+    if status is None or status.status_code is not StatusCode.ERROR:
+        return
+    if any(event.name == "exception" for event in span.events):
+        return
+    span._events.append(Event(name="exception", attributes={
+        "exception.type": str(span._attributes.get("error.type") or "ToolError"),
+        "exception.message": status.description or "Tool execution failed",
+        "exception.escaped": "False",
+    }))
+```
+
+The `get_weather` span now shows up as **errored** in LangSmith while the population/time spans stay green, and the agent still produces a final answer. Because this is keyed off span status, any tool that raises is captured — no per-tool wiring needed.
 
 For self-hosted LangSmith, set `OTEL_EXPORTER_OTLP_ENDPOINT` to `<your-host>/api/v1/otel` (do not include `/v1/traces`; the exporter adds that suffix).
 
 ## Project layout
 
-- `src/demo_agent/tools.py` — `@function_tool` definitions (including `get_weather`, which records errors on its trace span)
+- `src/demo_agent/tools.py` — `@function_tool` definitions (including `get_weather`, which raises to simulate a failure)
 - `src/demo_agent/agent.py` — `Agent` configuration
-- `src/demo_agent/otel.py` — OTEL export to LangSmith (GenAI instrumentor + OTLP exporter)
+- `src/demo_agent/otel.py` — OTEL export to LangSmith (GenAI instrumentor + OTLP exporter + error-event capture)
 - `src/demo_agent/__main__.py` — entrypoint using `Runner.run_sync`

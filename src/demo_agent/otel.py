@@ -5,8 +5,15 @@ from opentelemetry import trace
 from opentelemetry.context import Context
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.openai_agents import OpenAIAgentsInstrumentor
-from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor, TracerProvider
+from opentelemetry.sdk.trace import (
+    Event,
+    ReadableSpan,
+    Span,
+    SpanProcessor,
+    TracerProvider,
+)
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.trace import StatusCode
 
 _DEFAULT_OTLP_ENDPOINT = "https://api.smith.langchain.com/otel"
 
@@ -31,14 +38,24 @@ _OPERATION_TO_KIND = {
 
 
 class _LangSmithGenAIMappingProcessor(SpanProcessor):
-    """Map GenAI operation names to LangSmith run types before export.
+    """Adapt GenAI semconv spans to LangSmith before export.
 
-    LangSmith maps ``gen_ai.operation.name`` for ``chat``/``completion`` to
-    ``llm`` and ``gen_ai.tool.name`` to ``tool``, but agent/workflow spans
-    (``invoke_agent``, ``handoff``, ``guardrail``) may not become ``chain``
-    without an explicit ``langsmith.span.kind``. This processor (registered
-    ahead of the exporter, mirroring LangSmith's documented ``span._attributes``
-    editing pattern) adds those hints and sets run names from agent/tool attrs.
+    Two adaptations happen here, ahead of the exporter, mirroring LangSmith's
+    documented ``span._attributes`` editing pattern:
+
+    1. Run-type mapping. LangSmith maps ``gen_ai.operation.name`` for
+       ``chat``/``completion`` to ``llm`` and ``gen_ai.tool.name`` to ``tool``,
+       but agent/workflow spans (``invoke_agent``, ``handoff``, ``guardrail``)
+       may not become ``chain`` without an explicit ``langsmith.span.kind``.
+       We add those hints and set run names from agent/tool attrs.
+
+    2. Error capture. LangSmith derives a run's error/status from the OTEL
+       ``exception`` event (``exception.message`` / ``exception.stacktrace``),
+       *not* from the span's status code. The GenAI instrumentor sets an ERROR
+       status (from the Agents SDK span's error, e.g. a tool that raised) but
+       never records the event, so a failed tool call would otherwise look like
+       a normal response. We synthesize the missing ``exception`` event for any
+       span whose status is ERROR.
     """
 
     def on_start(
@@ -66,6 +83,35 @@ class _LangSmithGenAIMappingProcessor(SpanProcessor):
                 attributes[_LANGSMITH_TRACE_NAME] = agent_name
             elif isinstance(tool_name, str) and tool_name:
                 attributes[_LANGSMITH_TRACE_NAME] = tool_name
+
+        self._ensure_exception_event(span)
+
+    @staticmethod
+    def _ensure_exception_event(span: ReadableSpan) -> None:
+        """Add the ``exception`` event LangSmith needs for ERROR spans.
+
+        The exporter reads ``span.events``; we append directly (as with
+        ``_attributes``) so the synthesized event is serialized for export.
+        """
+        status = span.status
+        if status is None or status.status_code is not StatusCode.ERROR:
+            return
+        if any(event.name == "exception" for event in span.events):
+            return
+
+        attributes = span._attributes or {}
+        exception_type = attributes.get("error.type") or "ToolError"
+        message = status.description or "Tool execution failed"
+        span._events.append(
+            Event(
+                name="exception",
+                attributes={
+                    "exception.type": str(exception_type),
+                    "exception.message": message,
+                    "exception.escaped": "False",
+                },
+            )
+        )
 
     def shutdown(self) -> None:
         pass
