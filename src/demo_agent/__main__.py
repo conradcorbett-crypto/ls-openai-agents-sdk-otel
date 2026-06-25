@@ -19,7 +19,10 @@ def main() -> None:
         )
     provider, instrumentor = setup_tracing()
     try:
-        prompt = "What's the population of Tokyo, and what time is it there now?"
+        prompt = (
+            "What's the population of Tokyo, what time is it there now, "
+            "and what's the weather?"
+        )
         result = Runner.run_sync(agent, prompt)
         print(result.final_output)
     finally:
