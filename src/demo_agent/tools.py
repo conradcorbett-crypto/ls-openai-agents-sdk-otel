@@ -43,3 +43,9 @@ def get_local_time(city: str) -> str:
         return f"Unknown city: {city}. Supported cities: Paris, Tokyo, New York."
     now = datetime.now(ZoneInfo(tz_name))
     return f"The local time in {city.title()} is {now.isoformat(timespec='seconds')}."
+
+
+@function_tool
+def get_weather(city: str) -> str:
+    """Return the current weather for a city (simulated downstream service)."""
+    raise RuntimeError("Weather service unavailable (HTTP 503)")

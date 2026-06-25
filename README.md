@@ -20,17 +20,18 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-Copy `.env.example` to `.env` and set your OpenAI API key:
+Copy `.env.example` to `.env` and set your API keys:
 
 ```bash
 cp .env.example .env
-# Edit .env and set OPENAI_API_KEY=sk-...
+# Edit .env and set OPENAI_API_KEY=sk-... and LANGSMITH_API_KEY=lsv2_...
 ```
 
-Or export it directly:
+Or export them directly:
 
 ```bash
 export OPENAI_API_KEY=sk-...
+export LANGSMITH_API_KEY=lsv2_...
 ```
 
 ## Run
@@ -39,10 +40,73 @@ export OPENAI_API_KEY=sk-...
 python -m demo_agent
 ```
 
-The demo prompt asks for Tokyo's population and local time, which should invoke both tools (`get_city_population` and `get_local_time`).
+The demo prompt asks for Tokyo's population, local time, and weather, which invokes all three tools (`get_city_population`, `get_local_time`, and `get_weather`). `get_weather` deliberately fails to demonstrate error tracing (see [Tool errors](#tool-errors)).
+
+## Tracing
+
+Traces go to [LangSmith](https://smith.langchain.com/) over **OpenTelemetry** (no LangSmith SDK). The setup is env vars plus a short call to `setup_tracing()` in [`src/demo_agent/otel.py`](src/demo_agent/otel.py):
+
+```python
+from demo_agent.otel import setup_tracing, shutdown_tracing
+
+provider, instrumentor = setup_tracing()
+try:
+    result = Runner.run_sync(agent, prompt)
+finally:
+    shutdown_tracing(provider, instrumentor)
+```
+
+LangSmith's [OpenAI Agents SDK guide](https://docs.langchain.com/langsmith/trace-with-openai-agents-sdk) documents the `OpenAIAgentsTracingProcessor` integration (which requires the LangSmith SDK). This demo instead stays on the pure [OpenTelemetry path](https://docs.langchain.com/langsmith/trace-with-opentelemetry): standard OTLP exporter, no LangSmith SDK.
+
+Under the hood, the [official OpenTelemetry GenAI instrumentor for OpenAI Agents](https://github.com/open-telemetry/opentelemetry-python-contrib/tree/main/instrumentation-genai/opentelemetry-instrumentation-openai-agents-v2) registers a trace processor on the Agents SDK that emits spans using the [OpenTelemetry GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/). LangSmith maps those attributes (`gen_ai.operation.name`, `gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.tool.name`, …) to native run types.
+
+> A parallel branch (`cursor/langsmith-otel-tracing`) uses the [OpenInference instrumentor](https://github.com/Arize-ai/openinference/tree/main/python/instrumentation/openinference-instrumentation-openai-agents) instead. This branch uses the official GenAI semconv instrumentor. LangSmith's published OTEL mapping table only lists `gen_ai.operation.name` → run type for `chat`/`completion`/`embedding`, not `invoke_agent` → `chain`, so a small custom `SpanProcessor` (`_LangSmithGenAIMappingProcessor`, registered ahead of the exporter) sets `langsmith.span.kind` and `langsmith.trace.name` for agent, tool, and workflow spans.
+
+You must flush the Agents SDK trace queue (`flush_traces()`) before flushing the OTLP exporter — the trace processor's own `force_flush()` is a no-op.
+
+Set in `.env`:
+
+- `LANGSMITH_API_KEY` — required
+- `LANGSMITH_PROJECT` — optional, defaults to `demo-agent`
+- `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` — optional, defaults to `span_and_event` (captures prompts/responses on spans and as OTEL events)
+
+After running, open that project in LangSmith to see the agent, LLM, and tool spans.
+
+## Tool errors
+
+The demo's `get_weather` tool simply raises to simulate a downstream outage — there is no tracing code in [`src/demo_agent/tools.py`](src/demo_agent/tools.py):
+
+```python
+@function_tool
+def get_weather(city: str) -> str:
+    raise RuntimeError("Weather service unavailable (HTTP 503)")
+```
+
+When a tool raises, the Agents SDK's built-in error handling returns an error *string* to the model (so the agent still answers) and marks the tracing span as errored, which the GenAI instrumentor maps to an OpenTelemetry `ERROR` status.
+
+That status alone is not enough: LangSmith derives a run's error/status from the OpenTelemetry [`exception` event](https://docs.langchain.com/langsmith/trace-with-opentelemetry#supported-opentelemetry-attribute-and-event-mapping) (`exception.message` / `exception.stacktrace`), **not** from the span's status code — and the instrumentor never records that event. So all of the trace instrumentation lives in [`src/demo_agent/otel.py`](src/demo_agent/otel.py): the `_LangSmithGenAIMappingProcessor` synthesizes the missing `exception` event for any span whose status is `ERROR`, just before export:
+
+```python
+def _ensure_exception_event(span):
+    status = span.status
+    if status is None or status.status_code is not StatusCode.ERROR:
+        return
+    if any(event.name == "exception" for event in span.events):
+        return
+    span._events.append(Event(name="exception", attributes={
+        "exception.type": str(span._attributes.get("error.type") or "ToolError"),
+        "exception.message": status.description or "Tool execution failed",
+        "exception.escaped": "False",
+    }))
+```
+
+The `get_weather` span now shows up as **errored** in LangSmith while the population/time spans stay green, and the agent still produces a final answer. Because this is keyed off span status, any tool that raises is captured — no per-tool wiring needed.
+
+For self-hosted LangSmith, set `OTEL_EXPORTER_OTLP_ENDPOINT` to `<your-host>/api/v1/otel` (do not include `/v1/traces`; the exporter adds that suffix).
 
 ## Project layout
 
-- `src/demo_agent/tools.py` — `@function_tool` definitions
+- `src/demo_agent/tools.py` — `@function_tool` definitions (including `get_weather`, which raises to simulate a failure)
 - `src/demo_agent/agent.py` — `Agent` configuration
+- `src/demo_agent/otel.py` — OTEL export to LangSmith (GenAI instrumentor + OTLP exporter + error-event capture)
 - `src/demo_agent/__main__.py` — entrypoint using `Runner.run_sync`
